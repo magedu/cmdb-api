@@ -1,6 +1,7 @@
 import requests
 import string
 import logging
+import datetime
 from os import path as os_path
 from tornado.web import RequestHandler
 from tornado.web import HTTPError
@@ -31,6 +32,8 @@ class SchemaHandler(RestMixin, RequestHandler):
     @staticmethod
     def check_conflict(schema):
         origin = SchemaHandler.get_schema(schema['name'])
+        if origin['pk'] != schema['pk']:
+            raise SchemaError('pk can not modify')
         if not {field['name'] for field in schema['fields']}.issuperset(
                 {field['name'] for field in origin.get('fields', [])}):
             raise SchemaError('conflict check fail')
@@ -57,7 +60,7 @@ class SchemaHandler(RestMixin, RequestHandler):
             if field.get(key) is None or not isinstance(field.get(key), bool):
                 field[key] = False
                 logging.warning('field {0} {1} is nut set or is not a bool, set False'.format(field['name'], key))
-        if field['type'] not in ('string', 'long', 'double', 'datetime', 'ip'):
+        if field['type'] not in ('string', 'long', 'double', 'date', 'ip'):
             raise SchemaError('type error')
         if field.get('ref'):
             schema_name, field_name = field.get('ref').split('::')
@@ -77,6 +80,61 @@ class SchemaHandler(RestMixin, RequestHandler):
             SchemaHandler.check_conflict(schema)
         for field in schema['fields']:
             SchemaHandler.validate_field(field)
+        if not any((field['name'] == schema['pk'] for field in schema['fields'])):
+            raise SchemaError('pk is not a field')
+
+    @staticmethod
+    def make_mapping(schema):
+        properties = {}
+        for field in schema['fields']:
+            if field['type'] == 'string':
+                properties[field['name']] = {
+                    'type': 'string',
+                    'index': 'not_analyzed'
+                }
+            else:
+                properties[field['name']] = {
+                    'type': field['type']
+                }
+        return {'properties': properties}
+
+    @staticmethod
+    def create_index(name):
+        settings = {
+            'index': {
+                'number_of_shards': options.shards,
+                'number_of_replicas': options.replicas
+            }
+        }
+        mapping = {
+            'properties': {
+                'name': {'type': 'string', 'index': 'not_analyzed'},
+                'pk': {'type': 'string', 'index': 'not_analyzed'},
+                'version': {'type': 'long'},
+                'timestamp': {'type': 'date'},
+                'fields': {
+                    'type': 'nested',
+                    'properties': {
+                        'name': {'type': 'string', 'index': 'not_analyzed'},
+                        'type': {'type': 'string', 'index': 'not_analyzed'},
+                        'require': {'type': 'boolean'},
+                        'multi': {'type': 'boolean'},
+                        'unique': {'type': 'boolean'},
+                        'ref': {'type': 'string', 'index': 'not_analyzed'}
+                    }
+                }
+            }
+        }
+
+        r = requests.put('{0}/{1}'.format(options.es, name), json={
+            'settings': settings,
+            'mappings': {
+                'schema': mapping,
+                'schema_history': mapping
+            }
+        })
+        if r.status_code != 200:
+            raise HTTPError(status_code=500, reason='create index {0} error'.format(name))
 
     def post(self, *args, **kwargs):
         payload = self.get_payload()
@@ -85,6 +143,27 @@ class SchemaHandler(RestMixin, RequestHandler):
             node = os_path.join(options.root, payload['name'])
             self.application.zk.create(node)
             SchemaHandler.validate_schema(payload)
+            payload['version'] = 0
+            if SchemaHandler.is_schema_exist(payload):
+                payload['version'] = SchemaHandler.get_schema(payload['name'])['version'] + 1
+            else:
+                SchemaHandler.create_index(payload['name'])
+            payload['timestamp'] = int(datetime.datetime.now().timestamp() * 1000)
+            mapping = SchemaHandler.make_mapping(payload)
+            r = requests.put('{0}/{1}/_mapping/{entity_history}'.format(options.es, payload['name']), json=mapping)
+            if r.status_code != 200:
+                raise HTTPError(status_code=500, reason='put mapping error, response code is {0}'.format(r.status_code))
+            r = requests.put('{0}/{1}/_mapping/{entity}'.format(options.es, payload['name']), json=mapping)
+            if r.status_code != 200:
+                raise HTTPError(status_code=500, reason='put mapping error, response code is {0}'.format(r.status_code))
+            r = requests.put('{0}/{1}/schema_history'.format(options.es, payload['name']), json=payload)
+            if r.status_code != 200:
+                raise HTTPError(status_code=500,
+                                reason='put schema history error, response code is {0}'.format(r.status_code))
+            r = requests.put('{0}/{1}/schema/{3}'.format(options.es, payload['name'], payload['name']), json=payload)
+            if r.status_code != 200:
+                raise HTTPError(status_code=500,
+                                reason='put schema error, response code is {0}'.format(r.status_code))
         except KeyError:
             raise HTTPError(status_code=400, reason='schema name require')
         except NodeExistsError:
