@@ -1,5 +1,6 @@
 import json
 from tornado.web import HTTPError
+from .exceptions import EntityError, SchemaError
 
 
 class RestMixin:
@@ -17,6 +18,11 @@ class RestMixin:
         if isinstance(e, HTTPError):
             self.set_status(e.status_code, reason=e.reason)
             self.jsonify(code=e.status_code, message=e.reason)
+            self.finish()
+            return
+        if isinstance(e, (EntityError, SchemaError)):
+            self.set_status(400, reason=str(e))
+            self.jsonify(code=400, message=str(e))
             self.finish()
             return
         self.set_status(500, reason=str(e))

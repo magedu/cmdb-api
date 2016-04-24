@@ -9,13 +9,17 @@ from tornado.web import HTTPError
 from tornado.options import options
 from kazoo.exceptions import NodeExistsError
 from .mixins import RestMixin
-
-
-class SchemaError(Exception):
-    pass
+from .exceptions import SchemaError
 
 
 class SchemaHandler(RestMixin, RequestHandler):
+    @staticmethod
+    def list_all_schema():
+        r = requests.get('{0}/_stats'.format(options.es))
+        if r.status_code >= 300:
+            raise SchemaError('list all schema error {0}'.format(r.text))
+        return r.json().get('indices', {}).keys()
+
     @staticmethod
     def is_schema_exist(name):
         resp = requests.head('{0}/{1}'.format(options.es, name))
@@ -194,6 +198,9 @@ class SchemaHandler(RestMixin, RequestHandler):
                 self.application.zk.delete(node)
 
     def get(self, name):
+        if name == '_list':
+            self.jsonify(code=200, schemas=list(SchemaHandler.list_all_schema()))
+            return
         if not SchemaHandler.is_schema_exist(name):
             raise HTTPError(status_code=404, reason='schema {0} not exist'.format(name))
         self.jsonify(code=200, schema=SchemaHandler.get_schema(name))
